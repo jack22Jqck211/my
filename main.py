@@ -1,4 +1,5 @@
 import asyncio
+import heapq
 import json
 import os
 import hashlib
@@ -329,13 +330,21 @@ class XHTTPSession:
     def __init__(self, uuid: str):
         self.uuid = uuid
         self.conn_id = secrets.token_urlsafe(8)
-        self.to_client: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=512)
-        self.from_client: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=512)
+        # Reduced from 512 to 64 to cap per-session buffer at ~4MB and prevent OOM
+        self.to_client: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
+        self.from_client: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
         self.tcp_reader: asyncio.StreamReader | None = None
         self.tcp_writer: asyncio.StreamWriter | None = None
         self.started = False
         self.closed = False
         self.created_at = datetime.now().isoformat()
+        # Bug fix #1: seq reordering — holds out-of-order chunks until their turn
+        self._seq_next: int = 0
+        self._seq_heap: list = []          # (seq_int, data) min-heap
+        self._seq_lock = asyncio.Lock()
+        self._seq_ready = asyncio.Event()  # fired when a chunk is added to heap
+        # Bug fix #6: only one GET consumer allowed at a time
+        self.get_consumer_lock = asyncio.Lock()
 
 XHTTP_SESSIONS: dict[str, XHTTPSession] = {}
 XHTTP_SESSIONS_LOCK = asyncio.Lock()
@@ -344,7 +353,8 @@ XHTTP_SESSIONS_LOCK = asyncio.Lock()
 async def xhttp_tcp_relay(session: XHTTPSession):
     uuid = session.uuid
     try:
-        first_chunk = await asyncio.wait_for(session.from_client.get(), timeout=15.0)
+        # Bug fix #5: raised from 15s → 45s to tolerate high-latency first POST
+        first_chunk = await asyncio.wait_for(session.from_client.get(), timeout=45.0)
         if first_chunk is None:
             return
 
@@ -352,12 +362,166 @@ async def xhttp_tcp_relay(session: XHTTPSession):
         size = len(first_chunk)
         stats["total_bytes"] += size
         stats["total_requests"] += 1
-        hourly_traffic[datetime.now().strftime("%H:00")] += size
+        hour_key = datetime.now().strftime("%H:00")
+        hourly_traffic[hour_key] += size
+        # Prune old hourly_traffic keys to prevent memory creep (keep last 48 hours)
+        if len(hourly_traffic) > 48:
+            oldest = sorted(hourly_traffic.keys())[:-48]
+            for k in oldest:
+                del hourly_traffic[k]
         await add_usage(uuid, size)
 
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(address, port), timeout=10.0
-        )
+        # Bug fix #2: check VLESS command — 0x01=TCP, 0x02=UDP
+        if command == 0x02:
+            # UDP relay via asyncio datagram transport
+            loop = asyncio.get_event_loop()
+            transport = None
+            udp_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=64)
+
+            class _UDPProto(asyncio.DatagramProtocol):
+                def datagram_received(self, data: bytes, addr):
+                    try:
+                        udp_queue.put_nowait(data)
+                    except asyncio.QueueFull:
+                        pass
+                def error_received(self, exc):
+                    logger.warning(f"[XHTTP-UDP] error: {exc}")
+                def connection_lost(self, exc):
+                    try:
+                        udp_queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass
+
+            transport, _ = await asyncio.wait_for(
+                loop.create_datagram_endpoint(
+                    _UDPProto,
+                    remote_addr=(address, port),
+                    family=0,  # let OS pick
+                ),
+                timeout=10.0,
+            )
+            connections[session.conn_id] = {
+                "uuid": uuid, "connected_at": session.created_at,
+                "bytes": 0, "target": f"udp://{address}:{port}"
+            }
+            logger.info(f"[XHTTP-UDP] {session.conn_id} → {address}:{port}")
+
+            # VLESS response header
+            await session.to_client.put(b"\x00\x00")
+
+            if initial_payload:
+                transport.sendto(initial_payload)
+                p_size = len(initial_payload)
+                stats["total_bytes"] += p_size
+                connections[session.conn_id]["bytes"] += p_size
+                hourly_traffic[datetime.now().strftime("%H:00")] += p_size
+                await add_usage(uuid, p_size)
+
+            async def udp_client_to_remote():
+                try:
+                    while not session.closed:
+                        try:
+                            data = await asyncio.wait_for(session.from_client.get(), timeout=60.0)
+                        except asyncio.TimeoutError:
+                            continue
+                        if data is None:
+                            break
+                        size = len(data)
+                        if not await check_quota(uuid, size):
+                            break
+                        stats["total_bytes"] += size
+                        connections[session.conn_id]["bytes"] += size
+                        hourly_traffic[datetime.now().strftime("%H:00")] += size
+                        await add_usage(uuid, size)
+                        transport.sendto(data)
+                except Exception:
+                    pass
+
+            async def udp_remote_to_client():
+                try:
+                    while not session.closed:
+                        try:
+                            data = await asyncio.wait_for(udp_queue.get(), timeout=60.0)
+                        except asyncio.TimeoutError:
+                            continue
+                        if data is None:
+                            break
+                        size = len(data)
+                        if not await check_quota(uuid, size):
+                            break
+                        stats["total_bytes"] += size
+                        connections[session.conn_id]["bytes"] += size
+                        hourly_traffic[datetime.now().strftime("%H:00")] += size
+                        await add_usage(uuid, size)
+                        await session.to_client.put(data)
+                except Exception:
+                    pass
+                finally:
+                    await session.to_client.put(None)
+
+            task_up = asyncio.create_task(udp_client_to_remote())
+            task_down = asyncio.create_task(udp_remote_to_client())
+            done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            if transport:
+                transport.close()
+            return
+
+        # command == 0x01: TCP relay
+        # Bug fix #4: Happy Eyeballs — try both IPv4 and IPv6, use whichever connects first
+        import socket as _socket
+        try:
+            infos = await asyncio.wait_for(
+                asyncio.get_event_loop().getaddrinfo(
+                    address, port,
+                    type=_socket.SOCK_STREAM,
+                    proto=_socket.IPPROTO_TCP,
+                ),
+                timeout=5.0,
+            )
+        except Exception:
+            infos = []
+
+        if not infos:
+            raise OSError(f"could not resolve {address}")
+
+        # Deduplicate: one IPv6 candidate first, then IPv4 (Happy Eyeballs ordering)
+        sorted_infos = sorted(infos, key=lambda x: (0 if x[0] == _socket.AF_INET6 else 1))
+        reader = writer = None
+
+        async def _try_connect(info):
+            af, stype, proto, _, sockaddr = info
+            sock = _socket.socket(af, _socket.SOCK_STREAM)
+            sock.setblocking(False)
+            try:
+                await asyncio.get_event_loop().sock_connect(sock, sockaddr)
+                r, w = await asyncio.open_connection(sock=sock)
+                return r, w
+            except Exception:
+                sock.close()
+                raise
+
+        tasks = [asyncio.create_task(_try_connect(info)) for info in sorted_infos[:4]]
+        try:
+            for fut in asyncio.as_completed(tasks):
+                try:
+                    reader, writer = await asyncio.wait_for(fut, timeout=10.0)
+                    # Cancel remaining racing tasks
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    break
+                except Exception:
+                    continue
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
+        if reader is None or writer is None:
+            raise OSError(f"all connection attempts to {address}:{port} failed")
+
         session.tcp_reader = reader
         session.tcp_writer = writer
 
@@ -391,7 +555,7 @@ async def xhttp_tcp_relay(session: XHTTPSession):
                     if not await check_quota(uuid, size):
                         break
                     stats["total_bytes"] += size
-                    connections.get(session.conn_id, {})["bytes"] = connections.get(session.conn_id, {}).get("bytes", 0) + size
+                    connections[session.conn_id]["bytes"] += size
                     hourly_traffic[datetime.now().strftime("%H:00")] += size
                     await add_usage(uuid, size)
                     writer.write(data)
@@ -414,7 +578,7 @@ async def xhttp_tcp_relay(session: XHTTPSession):
                     if not await check_quota(uuid, size):
                         break
                     stats["total_bytes"] += size
-                    connections.get(session.conn_id, {})["bytes"] = connections.get(session.conn_id, {}).get("bytes", 0) + size
+                    connections[session.conn_id]["bytes"] += size
                     hourly_traffic[datetime.now().strftime("%H:00")] += size
                     await add_usage(uuid, size)
                     await session.to_client.put(data)
@@ -465,19 +629,50 @@ async def xhttp_downstream(uuid: str, session_id: str, request: Request):
     logger.info(f"[XHTTP] GET session={session_id} uuid={uuid}")
     session = await _get_or_create_session(uuid, session_id)
 
+    # Bug fix #6: only one GET consumer allowed; a new GET replaces the old one
+    # by acquiring the lock exclusively. The previous consumer will lose the lock
+    # and should stop (we signal via session.closed temporarily — actually we just
+    # let the new generator take over; the old one will get None from the queue
+    # eventually). We use trylock: if locked, we wait (stale GET is still alive).
+    # Using acquire() here makes new GET wait for old one to finish, preventing split reads.
+    got_lock = session.get_consumer_lock.locked()
+    # We use a non-blocking approach: acquire with a short timeout; if the old GET
+    # is still up we forcefully evict it by closing the session.
+    consumer_lock_acquired = False
+    try:
+        consumer_lock_acquired = await asyncio.wait_for(
+            session.get_consumer_lock.acquire(), timeout=5.0
+        )
+    except asyncio.TimeoutError:
+        # Previous GET still alive after 5s; close the session so old GET exits
+        session.closed = True
+        await session.to_client.put(None)
+        raise HTTPException(status_code=409, detail="GET stream already active")
+
+    # Bug fix #3: real keepalive — send a small padding frame every 20 seconds
+    # to keep Railway/LB from closing the idle TCP connection.
+    # We use a single null byte (harmless to the XHTTP client which ignores it).
+    KEEPALIVE_INTERVAL = 20.0   # seconds — well under typical 30–60s LB idle timeout
+    KEEPALIVE_PADDING = b"\x00" # one null byte; Xray client ignores trailing zeros
+
     async def generate():
         try:
             while True:
                 try:
-                    chunk = await asyncio.wait_for(session.to_client.get(), timeout=120.0)
+                    chunk = await asyncio.wait_for(
+                        session.to_client.get(), timeout=KEEPALIVE_INTERVAL
+                    )
                 except asyncio.TimeoutError:
-                    yield b""
+                    # Bug fix #3: yield real bytes so the TCP frame actually goes out
+                    yield KEEPALIVE_PADDING
                     continue
                 if chunk is None:
                     break
                 yield chunk
         except Exception:
             pass
+        finally:
+            session.get_consumer_lock.release()
 
     return StreamingResponse(
         generate(),
@@ -495,14 +690,26 @@ async def xhttp_upstream(uuid: str, session_id: str, seq: str, request: Request)
     await ensure_default_link()
     if not await check_quota(uuid, 0):
         raise HTTPException(status_code=403, detail="quota exceeded or link disabled")
-    logger.info(f"[XHTTP] POST seq={seq} session={session_id} uuid={uuid}")
+    try:
+        seq_int = int(seq)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid seq")
+    logger.info(f"[XHTTP] POST seq={seq_int} session={session_id} uuid={uuid}")
     session = await _get_or_create_session(uuid, session_id)
     body = await request.body()
     if body:
-        try:
-            await asyncio.wait_for(session.from_client.put(body), timeout=10.0)
-        except asyncio.TimeoutError:
-            raise HTTPException(status_code=503, detail="session buffer full")
+        # Push this chunk into the reorder heap and flush in-order chunks
+        async with session._seq_lock:
+            heapq.heappush(session._seq_heap, (seq_int, body))
+            session._seq_ready.set()
+            # Drain all consecutive chunks that are now ready
+            while session._seq_heap and session._seq_heap[0][0] == session._seq_next:
+                _, chunk = heapq.heappop(session._seq_heap)
+                try:
+                    await asyncio.wait_for(session.from_client.put(chunk), timeout=10.0)
+                except asyncio.TimeoutError:
+                    raise HTTPException(status_code=503, detail="session buffer full")
+                session._seq_next += 1
     return Response(status_code=200, content=b"", media_type="application/octet-stream")
 
 
